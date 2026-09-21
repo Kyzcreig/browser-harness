@@ -1,5 +1,5 @@
 """CDP WS holder + IPC relay (Unix socket on POSIX, TCP loopback on Windows). One daemon per BU_NAME."""
-import asyncio, json, os, platform, socket, sys, time, urllib.error, urllib.request
+import asyncio, json, math, os, platform, socket, subprocess, sys, time, urllib.error, urllib.request
 from urllib.parse import urlparse
 from collections import deque
 from pathlib import Path
@@ -808,12 +808,76 @@ class Daemon:
             return {"error": msg}
 
 
+def tcp_connected():
+    """Conservative: even our own persistent CDP connection prevents expiry.
+
+    lsof errors are not evidence of disconnection. The idle watcher logs them
+    and restarts the connection-free observation window.
+    """
+    result = subprocess.run(
+        ["lsof", "-w", "-nP", "-a", "-p", str(os.getpid()),
+         "-iTCP", "-sTCP:ESTABLISHED", "-F", "p"],
+        capture_output=True, text=True, timeout=5,
+    )
+    if result.stderr or result.returncode not in (0, 1):
+        raise RuntimeError("could not inspect daemon TCP connections")
+    if result.returncode == 1 and not result.stdout:
+        return False
+    if result.returncode == 0 and f"p{os.getpid()}\n" in result.stdout:
+        return True
+    raise RuntimeError("unexpected lsof connection response")
+
+
 async def serve(d):
+    idle_seconds = float(os.environ.get("BU_IDLE_EXIT_HOURS", "24")) * 3600
+    if not math.isfinite(idle_seconds) or idle_seconds <= 0:
+        raise ValueError("BU_IDLE_EXIT_HOURS must be finite and positive")
+    last_activity = time.monotonic()
+    active_clients = 0
+    expiring = False
+
+    async def idle_watch():
+        nonlocal expiring
+        disconnected_since = None
+        while True:
+            await asyncio.sleep(min(60, idle_seconds / 4))
+            try:
+                connected = await asyncio.to_thread(tcp_connected)
+            except Exception as e:
+                log(f"idle-watch: cannot measure connections: {type(e).__name__}")
+                disconnected_since = None
+                continue
+            now = time.monotonic()
+            if connected or active_clients:
+                disconnected_since = None
+                continue
+            if disconnected_since is None:
+                disconnected_since = now
+            if now - max(last_activity, disconnected_since) >= idle_seconds:
+                expiring = True
+                log(f"idle-watch: expiring after {idle_seconds:g}s idle and disconnected")
+                # Use the ordinary shutdown path (including cloud stop/recovery
+                # barriers); a failed cloud stop must not be reported as success.
+                response = await d.handle({"meta": "shutdown", "token": ipc.expected_token()})
+                if response.get("error"):
+                    expiring = False
+                    log("idle-watch: shutdown failed; retrying after another idle window")
+                    disconnected_since = None
+                else:
+                    return
+
     async def handler(reader, writer):
+        nonlocal last_activity, active_clients
+        if expiring:
+            writer.close()
+            return
+        active_clients += 1
         try:
             line = await reader.readline()
             if not line: return
             resp = await d.handle(json.loads(line))
+            last_activity = time.monotonic()
+            log(f"last-command-at: {time.time():.6f}")
             writer.write((json.dumps(resp, default=str) + "\n").encode())
             await writer.drain()
         except Exception as e:
@@ -825,16 +889,20 @@ async def serve(d):
                 pass
         finally:
             writer.close()
+            active_clients -= 1
+            last_activity = time.monotonic()
 
     serve_task = asyncio.create_task(ipc.serve(NAME, handler))
     stop_task = asyncio.create_task(d.stop.wait())
+    idle_task = asyncio.create_task(idle_watch())
     await asyncio.sleep(0.05)  # let serve() bind so sock_addr() resolves to the live endpoint
     log(f"listening on {ipc.sock_addr(NAME)} (name={NAME}, remote={REMOTE_ID or 'local'})")
     try:
-        await asyncio.wait({serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+        await asyncio.wait({serve_task, stop_task, idle_task}, return_when=asyncio.FIRST_COMPLETED)
         if serve_task.done(): await serve_task  # surfaces a serve crash
+        if idle_task.done(): await idle_task
     finally:
-        for t in (serve_task, stop_task):
+        for t in (serve_task, stop_task, idle_task):
             t.cancel()
             try: await t
             except (asyncio.CancelledError, Exception): pass

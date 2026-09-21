@@ -54,6 +54,39 @@ stdio, so any MCP client (Claude Code, Devin, Cursor, etc.) can drive the
 browser without writing a second CDP layer. See [docs/MCP.md](docs/MCP.md) for
 setup and client configuration.
 
+## Daemon lifetime and monitoring
+
+Named sessions (`BU_NAME`) persist across CLI calls; a detached daemon with
+parent PID 1 is not by itself abandoned. A daemon exits after both command
+inactivity and observed absence of connections exceed `BU_IDLE_EXIT_HOURS`
+(default **24**, a finite positive number). Command completion timestamps are
+recorded as `last-command-at` in its log. Open IPC clients protect ongoing work.
+The connection check uses `lsof`; missing/failed inspection logs an error and
+keeps the daemon alive. Automatic expiry therefore requires POSIX with `lsof`.
+
+This is deliberately conservative: the daemon's own established CDP websocket
+also prevents expiry. A merely unused but still connected browser is **not**
+automatically closed. Disconnected daemons must accumulate a fresh connection-free
+window after restart or a probe error. The check interval is at most 60 seconds.
+
+An optional POSIX watchdog follows the transition-alert pattern (high/recovered,
+quiet between transitions, failed census/delivery exits nonzero, no process kills):
+
+```sh
+python -m browser_harness.watchdog --state /path/to/watchdog-state.json --threshold 32
+# Add --notify /path/to/notify for a notifier accepting --severity/--source/--body.
+```
+
+Have your supervisor run it periodically and monitor its exit status and the
+state file's `checked_at` heartbeat. The threshold counts **reparented** daemons,
+including connected ones, to flag accumulation for investigation, not authorize
+cleanup. No scheduled job is installed by the package.
+
+Verification without touching a live browser:
+`uv run --with pytest python -m pytest tests/unit tests/integration/test_idle_exit.py -q`.
+The synthetic daemon acceptance uses real IPC/lsof and `BU_IDLE_EXIT_HOURS=0.01`;
+it must exit and remove its endpoint within two minutes.
+
 ## Contributing
 
 Bug fixes, documentation improvements, and agent-generated domain skills are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
