@@ -11,6 +11,8 @@ mutants = [
     ('no-expiry', 'daemon.py', 'if now - max(last_activity, disconnected_since) >= idle_seconds:', 'if False:', 'test_disconnected_daemon_expires_through_real_serve'),
     ('ignore-tcp', 'daemon.py', 'if connected or active_clients:', 'if active_clients:', 'test_connection_or_unknown_state_prevents_expiry[tcp]'),
     ('ignore-ipc', 'daemon.py', 'if connected or active_clients:', 'if connected:', 'test_connection_or_unknown_state_prevents_expiry[ipc]'),
+    ('ignore-command-activity', 'daemon.py', 'max(last_activity, disconnected_since)', 'disconnected_since', 'test_activity_and_connection_free_windows_restart[command]'),
+    ('keep-old-disconnection-window', 'daemon.py', 'if connected or active_clients:\n                disconnected_since = None', 'if connected or active_clients:\n                pass', 'test_activity_and_connection_free_windows_restart[connection]'),
     ('no-alert', 'watchdog.py', 'if status != previous:', 'if False:', 'test_transitions_are_delivered_once_and_failure_retries'),
     ('no-dedup', 'watchdog.py', 'if status != previous:', 'if True:', 'test_transitions_are_delivered_once_and_failure_retries'),
     ('ignore-delivery-error', 'watchdog.py', '                result.check_returncode()', '                pass', 'test_transitions_are_delivered_once_and_failure_retries'),
@@ -35,4 +37,4 @@ for label, filename, old, new, test in mutants:
         print(label, 'exit', result.returncode, result.stdout.splitlines()[-1:])
         assert result.returncode == 1 and '1 failed' in result.stdout, result.stdout + result.stderr
         assert (root / 'src' / 'browser_harness' / filename).read_text() == original
-print('6/6 behavioral mutants killed; working sources unchanged')
+print(f'{len(mutants)}/{len(mutants)} behavioral mutants killed; working sources unchanged')

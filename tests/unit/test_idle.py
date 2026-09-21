@@ -1,6 +1,7 @@
 import asyncio
 import os
 import subprocess
+import types
 
 import pytest
 
@@ -61,7 +62,7 @@ def test_connection_or_unknown_state_prevents_expiry(monkeypatch, mode):
                     def close(self): pass
                 client = asyncio.create_task(handler(reader, Writer()))
             async def enough_probes():
-                while probes < 12:
+                while probes < 12 and not task.done():
                     await asyncio.sleep(0.01)
             await asyncio.wait_for(enough_probes(), 5)
             assert not task.done()
@@ -109,3 +110,47 @@ def test_invalid_expiry_refused(monkeypatch, hours):
     monkeypatch.setenv('BU_IDLE_EXIT_HOURS', hours)
     with pytest.raises(ValueError):
         asyncio.run(daemon.serve(daemon.Daemon()))
+
+
+@pytest.mark.parametrize('reset', ['command', 'connection'])
+def test_activity_and_connection_free_windows_restart(monkeypatch, reset):
+    async def scenario():
+        d = daemon.Daemon()
+        d.stop = asyncio.Event()
+        monkeypatch.setenv('BU_IDLE_EXIT_HOURS', '0.01')
+        clock = [0]
+        messages = []
+        handler = None
+        monkeypatch.setattr(daemon, 'time', types.SimpleNamespace(monotonic=lambda: clock[0], time=lambda: 1000 + clock[0]))
+        monkeypatch.setattr(daemon, 'log', messages.append)
+        async def server(name, callback):
+            nonlocal handler
+            handler = callback
+            await asyncio.Event().wait()
+        monkeypatch.setattr(daemon.ipc, 'serve', server)
+        monkeypatch.setattr(daemon.ipc, 'cleanup_endpoint', lambda name: None)
+        steps = iter([0, 35, 40, 70, 77])
+        async def probe(fn):
+            clock[0] = next(steps)
+            assert not d.stop.is_set(), 'expired before the restarted window elapsed'
+            if clock[0] == 35 and reset == 'command':
+                reader = asyncio.StreamReader()
+                reader.feed_data(b'{"meta":"ping"}\n')
+                class Writer:
+                    def write(self, data): pass
+                    async def drain(self): pass
+                    def close(self): pass
+                await handler(reader, Writer())
+            return clock[0] == 35 and reset == 'connection'
+        async def sleep(seconds):
+            await asyncio.sleep(0)
+        proxy = types.SimpleNamespace(**{name: getattr(asyncio, name) for name in dir(asyncio)})
+        proxy.sleep = sleep
+        proxy.to_thread = probe
+        monkeypatch.setattr(daemon, 'asyncio', proxy)
+        await asyncio.wait_for(daemon.serve(d), 5)
+        assert clock[0] == 77
+        assert d.stop.is_set()
+        if reset == 'command':
+            assert 'last-command-at: 1035.000000' in messages
+    asyncio.run(scenario())
