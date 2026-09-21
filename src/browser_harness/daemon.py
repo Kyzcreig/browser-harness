@@ -840,7 +840,7 @@ async def serve(d):
         nonlocal expiring
         disconnected_since = None
         while True:
-            await asyncio.sleep(min(60, idle_seconds / 4))
+            await asyncio.sleep(min(3600, idle_seconds / 4))
             try:
                 connected = await asyncio.to_thread(tcp_connected)
             except Exception as e:
