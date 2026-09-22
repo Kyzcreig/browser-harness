@@ -67,7 +67,9 @@ keeps the daemon alive. Automatic expiry therefore requires POSIX with `lsof`.
 This is deliberately conservative: the daemon's own established CDP websocket
 also prevents expiry. A merely unused but still connected browser is **not**
 automatically closed. Disconnected daemons must accumulate a fresh connection-free
-window after restart or a probe error. The check interval is at most 60 seconds.
+window after restart or a probe error. The check interval is one quarter of the
+idle window, capped at one hour (9 seconds for a 36-second window). The default
+therefore inspects connections hourly rather than spawning `lsof` every minute.
 
 An optional POSIX watchdog follows the transition-alert pattern (high/recovered,
 quiet between transitions, failed census/delivery exits nonzero, no process kills):

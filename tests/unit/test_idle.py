@@ -8,6 +8,39 @@ import pytest
 from browser_harness import daemon
 
 
+@pytest.mark.parametrize(('hours', 'expected'), [(None, 3600), ('1', 900), ('0.01', 9)])
+def test_idle_poll_cadence_scales_with_window(monkeypatch, hours, expected):
+    async def scenario():
+        if hours is None:
+            monkeypatch.delenv('BU_IDLE_EXIT_HOURS', raising=False)
+        else:
+            monkeypatch.setenv('BU_IDLE_EXIT_HOURS', hours)
+        d = daemon.Daemon()
+        d.stop = asyncio.Event()
+        observed = asyncio.get_running_loop().create_future()
+        async def sleep(seconds):
+            if asyncio.current_task().get_coro().__name__ != 'idle_watch':
+                await asyncio.sleep(0)
+                return
+            observed.set_result(seconds)
+            await asyncio.Event().wait()
+        async def server(name, handler):
+            await asyncio.Event().wait()
+        proxy = types.SimpleNamespace(**{name: getattr(asyncio, name) for name in dir(asyncio)})
+        proxy.sleep = sleep
+        monkeypatch.setattr(daemon, 'asyncio', proxy)
+        monkeypatch.setattr(daemon, 'log', lambda message: None)
+        monkeypatch.setattr(daemon.ipc, 'serve', server)
+        monkeypatch.setattr(daemon.ipc, 'cleanup_endpoint', lambda name: None)
+        task = asyncio.create_task(daemon.serve(d))
+        try:
+            assert await asyncio.wait_for(observed, 5) == expected
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    asyncio.run(scenario())
+
+
 def test_disconnected_daemon_expires_through_real_serve(monkeypatch):
     async def scenario():
         d = daemon.Daemon()
