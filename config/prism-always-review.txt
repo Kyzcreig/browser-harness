@@ -1,4 +1,4 @@
 # Pipeline v2 D3: paths that always merit Prism review on Kyzcreig/browser-harness (fleet fork of browser-use/browser-harness).
 # Read at the PR's base sha by hermes-home scripts/lib/merge_policy.py; removing an entry is refused at merge (rc 43).
 # Seeded 2026-11-08 by Apollo with PR #4 (daemon selection lease), Ace 17:31 PT (discord 1569162596676931615).
-src/browser_harness/daemon.py
+# (no always-review paths yet: this fork is outside Prism coverage; add paths here only once a Prism lane reviews it)
