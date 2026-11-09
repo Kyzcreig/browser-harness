@@ -1,5 +1,5 @@
 """CDP WS holder + IPC relay (Unix socket on POSIX, TCP loopback on Windows). One daemon per BU_NAME."""
-import asyncio, json, math, os, platform, socket, subprocess, sys, time, urllib.error, urllib.request
+import asyncio, hmac, json, math, os, platform, secrets, socket, subprocess, sys, time, urllib.error, urllib.request
 from urllib.parse import urlparse
 from collections import deque
 from pathlib import Path
@@ -127,6 +127,9 @@ TOGGLE_BOOT_GRACE = 12
 # Cancellation should make an in-flight CDP call finish immediately. Keep the
 # drain bounded anyway so shutdown fails closed if a client ignores cancellation.
 RECOVERY_CANCEL_DRAIN_TIMEOUT = 2
+# Upper bound for a selection lease. A holder that dies is detected sooner via
+# its owner PID (POSIX); the TTL is the backstop when liveness cannot be checked.
+LEASE_MAX_TTL = 600
 TAB_MARKER_JS = "if(!document.title.startsWith('\U0001F434'))document.title='\U0001F434 '+document.title"
 
 
@@ -407,6 +410,19 @@ def is_reusable_new_tab_page(t):
     )
 
 
+def _owner_alive(pid):
+    """Best-effort liveness of a lease holder; unknown -> alive (the TTL still bounds it)."""
+    if pid is None or platform.system() == "Windows":
+        return True  # os.kill(pid, 0) sends CTRL_C_EVENT on Windows
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+
+
 class _PatientCDPClient(CDPClient):
     """CDPClient whose local Chrome approval handshake has no deadline."""
 
@@ -427,6 +443,10 @@ class Daemon:
         self.session = None
         self.target_id = None
         self.dedicated_target_id = None
+        # Incremented whenever the selected target changes, so a lease holder can
+        # prove the selection it pinned is the one still in force.
+        self.selection_generation = 0
+        self._lease = None
         self._dedicated_target_lock = asyncio.Lock()
         self._session_state_lock = asyncio.Lock()
         self._active_recoveries = 0
@@ -475,7 +495,7 @@ class Daemon:
                 "Target.attachToTarget", {"targetId": tid, "flatten": True}
             ))["sessionId"]
             self._record_session_replacement(replaces_session, self.session)
-            self.target_id = tid
+            self._select_target(tid)
             log(f"attached {tid} ({page.get('url','')[:80]}) session={self.session}")
             if enable_domains:
                 await self._enable_default_domains(self.session)
@@ -497,6 +517,12 @@ class Daemon:
             if inspect_tabs:
                 pages = [inspect_tabs[0]]
                 take_over = inspect_tabs[0]["targetId"]
+        lease = self._live_lease()
+        if lease:
+            # Recovery under a lease must keep the leased tab when it still exists.
+            pinned = [t for t in targets if t["targetId"] == lease["target_id"]]
+            if pinned:
+                pages, take_over = pinned, None
         if not pages:
             # No usable pages - create one instead of attaching to omnibox popup.
             tid = (await self.cdp.send_raw(
@@ -508,7 +534,7 @@ class Daemon:
             "Target.attachToTarget", {"targetId": pages[0]["targetId"], "flatten": True}
         ))["sessionId"]
         self._record_session_replacement(replaces_session, self.session)
-        self.target_id = pages[0]["targetId"]
+        self._select_target(pages[0]["targetId"])
         log(f"attached {pages[0]['targetId']} ({pages[0].get('url','')[:80]}) session={self.session}")
         if take_over:
             try:
@@ -561,6 +587,67 @@ class Daemon:
             except Exception as e:
                 log(f"enable {d} on {session_id}: {e}")
         await asyncio.gather(*(enable_one(d) for d in ("Page", "DOM", "Runtime", "Network")))
+
+    def _select_target(self, target_id):
+        if target_id != self.target_id:
+            self.selection_generation += 1
+        self.target_id = target_id
+
+    def _live_lease(self):
+        lease = self._lease
+        if lease and (time.monotonic() >= lease["expires"] or not _owner_alive(lease["owner_pid"])):
+            log("selection lease expired")
+            self._lease = None
+        return self._lease
+
+    def _lease_for(self, token):
+        lease = self._live_lease()
+        if lease and isinstance(token, str) and hmac.compare_digest(token, lease["token"]):
+            return lease
+        return None
+
+    async def _lease_acquire(self, req):
+        """Pin the current selection: until release/expiry, no caller can move it."""
+        ttl, owner = req.get("ttl"), req.get("owner_pid")
+        if type(ttl) not in (int, float) or not 0 < ttl <= LEASE_MAX_TTL:
+            return {"error": f"lease ttl must be in (0, {LEASE_MAX_TTL}] seconds"}
+        if owner is not None and type(owner) is not int:
+            return {"error": "lease owner_pid must be an integer"}
+        async with self._session_state_lock:
+            if self._live_lease():
+                return {"error": "selection_leased: another caller holds this browser's tab selection; retry"}
+            if not self.target_id:
+                return {"error": "not_attached"}
+            expected = req.get("target_id")
+            if expected is not None and expected != self.target_id:
+                return {"error": "selection_changed"}
+            target, generation = self.target_id, self.selection_generation
+            try:
+                info = (await self.cdp.send_raw("Target.getTargetInfo", {"targetId": target}))["targetInfo"]
+            except Exception:
+                return {"error": "cdp_disconnected"}
+            token = secrets.token_hex(16)
+            self._lease = {"token": token, "target_id": target, "generation": generation,
+                           "owner_pid": owner, "expires": time.monotonic() + ttl}
+            log(f"selection lease acquired on {target} (generation {generation}, ttl {ttl:g}s)")
+        return {"token": token, "targetId": target, "generation": generation,
+                "url": info.get("url", ""), "ttl": ttl}
+
+    def _lease_check(self, req):
+        lease = self._lease_for(req.get("token"))
+        if lease is None:
+            return {"error": "lease_invalid"}
+        if self.target_id != lease["target_id"] or self.selection_generation != lease["generation"]:
+            return {"error": "selection_changed"}
+        return {"targetId": lease["target_id"], "generation": lease["generation"],
+                "expires_in": lease["expires"] - time.monotonic()}
+
+    def _lease_release(self, req):
+        if self._lease_for(req.get("token")) is None:
+            return {"released": False}
+        self._lease = None
+        log("selection lease released")
+        return {"released": True}
 
     def _record_session_replacement(self, stale_session, replacement_session):
         """Remember which recovered session still controls the same tab."""
@@ -706,11 +793,18 @@ class Daemon:
                     "url": info.get("url") or "",
                 }
             return {"target_id": self.target_id, "session_id": self.session, "page": page}
+        if meta == "lease_acquire": return await self._lease_acquire(req)
+        if meta == "lease_check":   return self._lease_check(req)
+        if meta == "lease_release": return self._lease_release(req)
         if meta == "set_session":
             async with self._session_state_lock:
+                lease = self._live_lease()
+                new_target = req.get("target_id") or self.target_id
+                if lease and new_target != lease["target_id"]:
+                    return {"error": "selection_leased: another caller holds this browser's tab selection; retry"}
                 old_session = self.session
                 self.session = req.get("session_id")
-                self.target_id = req.get("target_id") or self.target_id
+                self._select_target(new_target)
                 new_session = self.session
             # Run the old-session Network.disable (defense in depth — keeps
             # background-tab traffic out of the global event buffer; the
